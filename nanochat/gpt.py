@@ -24,6 +24,7 @@ from nanochat.optim import MuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 when compatible and SDPA fallback otherwise
 from nanochat.flash_attention import flash_attn
+from nanochat.poly_attn import poly_attention, poly_attention_naive
 
 @dataclass
 class GPTConfig:
@@ -36,7 +37,8 @@ class GPTConfig:
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
-    window_pattern: str = "SSSL"
+    window_pattern: str = "L"
+    use_poly_attn: bool = False
 
 
 def norm(x):
@@ -127,6 +129,105 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
+    
+class CausalPolySelfAttention(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_kv_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        self.ve_gate_channels = 12
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        B, T, C = x.size()
+
+        # Project the input to get queries, keys, and values
+        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
+        if ve is not None:
+            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
+            v = v + gate.unsqueeze(-1) * ve
+
+        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
+        cos, sin = cos_sin
+        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+
+        # Flash Attention (FA3 or SDPA fallback)
+        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
+        if kv_cache is None:
+            # Training: causal attention with optional sliding window
+            if self.training:
+                q = q.transpose(1, 2)  # (B, H, T, D)
+                k = k.transpose(1, 2)
+                v = v.transpose(1, 2)
+                y = poly_attention(q, k, v)
+                y = y.transpose(1, 2)  # (B, T, H, D) back to original layout
+            else:
+                q = q.transpose(1, 2)  # (B, H, T, D)
+                k = k.transpose(1, 2)
+                v = v.transpose(1, 2)
+                y = poly_attention_naive(q, k, v)
+                y = y.transpose(1, 2)  # (B, T, H, D) back to original layout
+        else:
+            # Inference: use flash_attn_with_kvcache which handles cache management
+            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+
+            # fallback: manually manage KV cache
+            pos = kv_cache.cache_seqlens[0].item()  # assume uniform position across batch
+
+            # Insert new k, v into cache (in-place, matching FA3 behavior)
+            if k is not None and v is not None:
+                k_cache[:, pos:pos+T, :, :] = k
+                v_cache[:, pos:pos+T, :, :] = v
+
+            # Get full cache up to current position + new tokens
+            k_prev = k_cache[:, :pos, :, :]
+            v_prev = v_cache[:, :pos, :, :]
+
+            # Transpose to SDPA layout: (B, T, H, D) -> (B, H, T, D)
+            q_main = q.transpose(1, 2) * 2
+            k_prev = k_prev.transpose(1, 2)
+            v_prev = v_prev.transpose(1, 2)
+            k_main = k.transpose(1, 2)
+            v_main = v.transpose(1, 2)
+
+            dot_prev = q_main @ k_prev.transpose(2, 3)
+            att_prev = dot_prev.pow(9)+0.01*dot_prev
+            y_prev = att_prev @ v_prev
+
+            dot_main = q_main @ k_main.transpose(2, 3)
+            att_main = torch.tril(dot_main.pow(9)+0.01*dot_main)
+            y_main = att_main @ v_main
+
+            y = y_prev + y_main
+            y = norm(y)
+            y = y.transpose(1, 2)  # (B, H, T, D) back to original layout
+            
+            # Advance position after last layer processes
+            if self.layer_idx == kv_cache.n_layers - 1:
+                kv_cache.advance(T)
+
+        # Re-assemble the heads and project back to residual stream
+        y = y.contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -144,7 +245,10 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        if config.use_poly_attn:
+            self.attn = CausalPolySelfAttention(config, layer_idx)
+        else:
+            self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
