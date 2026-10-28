@@ -581,7 +581,7 @@ def poly_attention_naive(q_, k_, v_):
     q_ = q_.transpose(1, 2)
     k_ = k_.transpose(1, 2)
     v_ = v_.transpose(1, 2)
-    W_ = q_ @ k_.transpose(2, 3)
+    W_ = (q_ * 2) @ k_.transpose(2, 3)
     A_ = W_.pow(9) + 0.01 * W_
     A_ = torch.tril(A_)
     Y_ = A_ @ v_
