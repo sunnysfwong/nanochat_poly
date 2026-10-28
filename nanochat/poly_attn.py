@@ -97,9 +97,10 @@ def _fwd_inner(
 @triton.jit
 def _fwd_kernel(
     Q_ptr, K_ptr, V_ptr, Y_ptr, Z_ptr,
-    stride_b, stride_t, stride_d,
-    stride_z_b, stride_z_t,
+    stride_b, stride_h, stride_t, stride_d,
+    stride_z_b, stride_z_h, stride_z_t,
     L,
+    H: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     EVEN_L: tl.constexpr,
@@ -109,12 +110,15 @@ def _fwd_kernel(
 ):
     start_m = (tl.num_programs(0) - 1) - tl.program_id(0)
     pid_z = tl.program_id(1)
+    pid_b = pid_z // H
+    pid_h = pid_z % H
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_D)
 
-    Q_offset = pid_z * stride_b + offs_m[:, None] * stride_t + offs_d[None, :] * stride_d
+    bh_offset = pid_b * stride_b + pid_h * stride_h
+    Q_offset = bh_offset + offs_m[:, None] * stride_t + offs_d[None, :] * stride_d
     if EVEN_L and EVEN_D:
         Q_ = tl.load(Q_ptr + Q_offset)
     elif EVEN_D:
@@ -129,8 +133,8 @@ def _fwd_kernel(
         )
     Q_ = (Q_ * 2.0).to(Q_ptr.dtype.element_ty)
 
-    K_ptrs = K_ptr + pid_z * stride_b + offs_n[:, None] * stride_t + offs_d[None, :] * stride_d
-    V_ptrs = V_ptr + pid_z * stride_b + offs_n[:, None] * stride_t + offs_d[None, :] * stride_d
+    K_ptrs = K_ptr + bh_offset + offs_n[:, None] * stride_t + offs_d[None, :] * stride_d
+    V_ptrs = V_ptr + bh_offset + offs_n[:, None] * stride_t + offs_d[None, :] * stride_d
 
     X_ = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
     X_ = _fwd_inner(
@@ -154,7 +158,7 @@ def _fwd_kernel(
     Z_ = tl.rsqrt(Z_sq)
     Y_ = (X_ * Z_[:, None]).to(Q_ptr.dtype.element_ty)
 
-    Z_offset = pid_z * stride_z_b + offs_m * stride_z_t
+    Z_offset = pid_b * stride_z_b + pid_h * stride_z_h + offs_m * stride_z_t
     if EVEN_L and EVEN_D:
         tl.store(Y_ptr + Q_offset, Y_)
         tl.store(Z_ptr + Z_offset, Z_)
@@ -248,9 +252,10 @@ def _bwd_dq_inner(
 def _bwd_kernel_dQ(
     Q_ptr, K_ptr, V_ptr, Y_ptr, Z_ptr,
     dY_ptr, dX_ptr, dQ_ptr,
-    stride_b, stride_t, stride_d,
-    stride_z_b, stride_z_t,
+    stride_b, stride_h, stride_t, stride_d,
+    stride_z_b, stride_z_h, stride_z_t,
     L,
+    H: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     EVEN_L: tl.constexpr,
@@ -260,13 +265,16 @@ def _bwd_kernel_dQ(
 ):
     start_m = (tl.num_programs(0) - 1) - tl.program_id(0)
     pid_z = tl.program_id(1)
+    pid_b = pid_z // H
+    pid_h = pid_z % H
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_D)
 
-    Q_offset = pid_z * stride_b + offs_m[:, None] * stride_t + offs_d[None, :] * stride_d
-    Z_offset = pid_z * stride_z_b + offs_m * stride_z_t
+    bh_offset = pid_b * stride_b + pid_h * stride_h
+    Q_offset = bh_offset + offs_m[:, None] * stride_t + offs_d[None, :] * stride_d
+    Z_offset = pid_b * stride_z_b + pid_h * stride_z_h + offs_m * stride_z_t
 
     if EVEN_L and EVEN_D:
         Q_ = tl.load(Q_ptr + Q_offset)
@@ -307,8 +315,8 @@ def _bwd_kernel_dQ(
     else:
         tl.store(dX_ptr + Q_offset, dX_, mask=(offs_m[:, None] < L) & (offs_d[None, :] < D))
 
-    K_ptrs = K_ptr + pid_z * stride_b + offs_n[:, None] * stride_t + offs_d[None, :] * stride_d
-    V_ptrs = V_ptr + pid_z * stride_b + offs_n[:, None] * stride_t + offs_d[None, :] * stride_d
+    K_ptrs = K_ptr + bh_offset + offs_n[:, None] * stride_t + offs_d[None, :] * stride_d
+    V_ptrs = V_ptr + bh_offset + offs_n[:, None] * stride_t + offs_d[None, :] * stride_d
 
     dQ_ = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
     dQ_ = _bwd_dq_inner(
@@ -410,8 +418,9 @@ def _bwd_dkdv_inner(
 def _bwd_kernel_dKdV(
     Q_ptr, K_ptr, V_ptr,
     dX_ptr, dK_ptr, dV_ptr,
-    stride_b, stride_t, stride_d,
+    stride_b, stride_h, stride_t, stride_d,
     L,
+    H: tl.constexpr,
     D: tl.constexpr,
     BLOCK_D: tl.constexpr,
     EVEN_L: tl.constexpr,
@@ -421,12 +430,15 @@ def _bwd_kernel_dKdV(
 ):
     start_n = tl.program_id(0)
     pid_z = tl.program_id(1)
+    pid_b = pid_z // H
+    pid_h = pid_z % H
 
     offs_n = start_n * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_m = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_D)
 
-    KV_offset = pid_z * stride_b + offs_n[:, None] * stride_t + offs_d[None, :] * stride_d
+    bh_offset = pid_b * stride_b + pid_h * stride_h
+    KV_offset = bh_offset + offs_n[:, None] * stride_t + offs_d[None, :] * stride_d
     if EVEN_L and EVEN_D:
         K_ = tl.load(K_ptr + KV_offset)
         V_ = tl.load(V_ptr + KV_offset)
@@ -447,8 +459,8 @@ def _bwd_kernel_dKdV(
     dK_ = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
     dV_ = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
 
-    Q_ptrs = Q_ptr + pid_z * stride_b + offs_m[:, None] * stride_t + offs_d[None, :] * stride_d
-    dX_ptrs = dX_ptr + pid_z * stride_b + offs_m[:, None] * stride_t + offs_d[None, :] * stride_d
+    Q_ptrs = Q_ptr + bh_offset + offs_m[:, None] * stride_t + offs_d[None, :] * stride_d
+    dX_ptrs = dX_ptr + bh_offset + offs_m[:, None] * stride_t + offs_d[None, :] * stride_d
 
     dK_, dV_ = _bwd_dkdv_inner(
         dK_, dV_, K_, V_, Q_ptrs, dX_ptrs,
@@ -496,24 +508,25 @@ class PolyAttention(torch.autograd.Function):
         K_: torch.Tensor,
         V_: torch.Tensor,
     ):
-        B, H, L, D = Q_.shape
+        B, L, H, D = Q_.shape
         Z = B * H
         BLOCK_D = max(16, triton.next_power_of_2(D))
         EVEN_L = (L % 128) == 0
         EVEN_D = D == BLOCK_D
 
-        Q_ = Q_.reshape(Z, L, D).contiguous()
-        K_ = K_.reshape(Z, L, D).contiguous()
-        V_ = V_.reshape(Z, L, D).contiguous()
+        Q_ = Q_.contiguous()
+        K_ = K_.contiguous()
+        V_ = V_.contiguous()
         Y_ = torch.empty_like(Q_)
-        Z_ = torch.empty((Z, L), device=Q_.device, dtype=torch.float32)
+        Z_ = torch.empty((B, H, L), device=Q_.device, dtype=torch.float32)
 
         grid = lambda meta: (triton.cdiv(L, meta["BLOCK_M"]), Z)
         _fwd_kernel[grid](
             Q_, K_, V_, Y_, Z_,
-            Y_.stride(0), Y_.stride(1), Y_.stride(2),
-            Z_.stride(0), Z_.stride(1),
+            Y_.stride(0), Y_.stride(2), Y_.stride(1), Y_.stride(3),
+            Z_.stride(0), Z_.stride(1), Z_.stride(2),
             L,
+            H=H,
             D=D,
             BLOCK_D=BLOCK_D,
             EVEN_L=EVEN_L,
@@ -521,15 +534,15 @@ class PolyAttention(torch.autograd.Function):
         )
 
         ctx.save_for_backward(Q_, K_, V_, Y_, Z_)
-        ctx.shape = (B, H, L, D, Z, BLOCK_D, EVEN_L, EVEN_D)
-        return Y_.reshape(B, H, L, D)
+        ctx.shape = (B, L, H, D, Z, BLOCK_D, EVEN_L, EVEN_D)
+        return Y_
 
     @staticmethod
     def backward(ctx, dY_):
         Q_, K_, V_, Y_, Z_ = ctx.saved_tensors
-        B, H, L, D, Z, BLOCK_D, EVEN_L, EVEN_D = ctx.shape
+        B, L, H, D, Z, BLOCK_D, EVEN_L, EVEN_D = ctx.shape
 
-        dY_ = dY_.reshape(Z, L, D).contiguous()
+        dY_ = dY_.contiguous()
         dX_ = torch.empty_like(Q_)
         dQ_ = torch.empty_like(Q_)
         dK_ = torch.empty_like(K_)
@@ -539,9 +552,10 @@ class PolyAttention(torch.autograd.Function):
         _bwd_kernel_dQ[grid](
             Q_, K_, V_, Y_, Z_,
             dY_, dX_, dQ_,
-            V_.stride(0), V_.stride(1), V_.stride(2),
-            Z_.stride(0), Z_.stride(1),
+            V_.stride(0), V_.stride(2), V_.stride(1), V_.stride(3),
+            Z_.stride(0), Z_.stride(1), Z_.stride(2),
             L,
+            H=H,
             D=D,
             BLOCK_D=BLOCK_D,
             EVEN_L=EVEN_L,
@@ -551,23 +565,29 @@ class PolyAttention(torch.autograd.Function):
         _bwd_kernel_dKdV[grid](
             Q_, K_, V_,
             dX_, dK_, dV_,
-            V_.stride(0), V_.stride(1), V_.stride(2),
+            V_.stride(0), V_.stride(2), V_.stride(1), V_.stride(3),
             L,
+            H=H,
             D=D,
             BLOCK_D=BLOCK_D,
             EVEN_L=EVEN_L,
             EVEN_D=EVEN_D,
         )
 
-        return dQ_.reshape(B, H, L, D), dK_.reshape(B, H, L, D), dV_.reshape(B, H, L, D)
+        return dQ_, dK_, dV_
 
 
 def poly_attention_naive(q_, k_, v_):
-    W_ = (q_ * 2) @ k_.transpose(2, 3)
+    q_ = q_.transpose(1, 2)
+    k_ = k_.transpose(1, 2)
+    v_ = v_.transpose(1, 2)
+    W_ = q_ @ k_.transpose(2, 3)
     A_ = W_.pow(9) + 0.01 * W_
     A_ = torch.tril(A_)
     Y_ = A_ @ v_
-    return torch.nn.functional.rms_norm(Y_, (Y_.shape[-1],))
+    Y_ = torch.nn.functional.rms_norm(Y_, (Y_.shape[-1],))
+    Y_ = Y_.transpose(1, 2)
+    return Y_
 
 
 def poly_attention(q_, k_, v_):

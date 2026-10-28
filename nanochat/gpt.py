@@ -146,6 +146,7 @@ class CausalPolySelfAttention(nn.Module):
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.sequence_len = config.sequence_len
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -172,18 +173,10 @@ class CausalPolySelfAttention(nn.Module):
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
-            if self.training:
-                q = q.transpose(1, 2)  # (B, H, T, D)
-                k = k.transpose(1, 2)
-                v = v.transpose(1, 2)
+            if self.sequence_len == T:
                 y = poly_attention(q, k, v)
-                y = y.transpose(1, 2)  # (B, T, H, D) back to original layout
             else:
-                q = q.transpose(1, 2)  # (B, H, T, D)
-                k = k.transpose(1, 2)
-                v = v.transpose(1, 2)
                 y = poly_attention_naive(q, k, v)
-                y = y.transpose(1, 2)  # (B, T, H, D) back to original layout
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
