@@ -1,3 +1,88 @@
+# Branch Summary: Polynomial Kernel Attention
+
+In this branch, we replace standard softmax attention with an odd-degree **polynomial kernel attention** and achieve validation performance (`val_bpb`) on par with, or slightly better than, softmax attention across model scales.
+
+### Formulation
+
+Given $\ell_2$-normalized queries $\hat{Q}$ and keys $\hat{K}$, the causal attention output is computed as:
+
+$$\text{PolyAttn}(Q, K, V) = \text{RMSNorm}\!\left(\text{tril}\!\left(\phi(2\hat{Q}\hat{K}^\top)\right) V\right), \quad \text{where } \phi(x) = x^9 + 0.01x$$
+
+In PyTorch, the naive reference implementation looks like this:
+
+```py
+import torch
+import torch.nn.functional as F
+
+def poly_attn_naive(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """
+    Input/Output shapes: (B, H, T, D)
+    """
+    q = F.normalize(q, dim=-1)
+    k = F.normalize(k, dim=-1)
+    dot = (q * 2) @ k.transpose(2, 3)
+    att = torch.tril(dot.pow(9) + 0.01 * dot)
+    x = att @ v
+    return F.rms_norm(x, (x.size(-1),))
+```
+*(Note: For actual training, a custom fused Triton kernel in `nanochat/poly_attn.py` is used for memory efficiency and speed. `tok/sec` for using this kernel is about 98% of PyTorch scaled dot product attention)*
+
+### Experimental Results
+
+Experiments were conducted on an A100 GPU (Colab Runtime Version 2026.07) with a vocabulary size of `32768`. Below is the final validation bits-per-byte (`val_bpb`, lower is better) across depths:
+
+| Depth (`d`) | Softmax (`val_bpb`) | Polynomial (`val_bpb`) | $\Delta$ |
+|:-----------:|:-------------------:|:----------------------:|:--------:|
+| 6           | 1.0223              | **1.0198**             | -0.0025  |
+| 8           | 0.9458              | **0.9421**             | -0.0037  |
+| 10*         | 0.8928              | **0.8925**             | -0.0003  |
+| 12*         | **0.8465**          | 0.8475                 | +0.0010  |
+| 14*         | 0.8115              | **0.8107**             | -0.0008  |
+
+*\*Results for depths 10, 12, and 14 were obtained using an earlier revision of the kernel.*
+
+<details>
+<summary><b>Reproducibility Command (Colab / Bash)</b></summary>
+
+```shell
+%%shell
+#!/bin/bash
+
+pip install rustbpe
+
+git clone -b poly_attn --single-branch https://github.com/sunnysfwong/nanochat_poly.git
+
+cd nanochat_poly/
+
+export OMP_NUM_THREADS=1
+export NANOCHAT_BASE_DIR="/content/nanochat/"
+mkdir -p "$NANOCHAT_BASE_DIR"
+
+# Download the dataset and train the tokenizer
+python -m nanochat.dataset -n 50
+python -m scripts.tok_train --max-chars=2000000000 --vocab-size=32768
+
+depth=6
+RESULTS_DIR="/content/nanochat/results/"
+# TAG="d${depth}_ori_gh" # Use this and omit --use_poly_attn for softmax baseline
+TAG="d${depth}_poly_gh"
+mkdir -p "$RESULTS_DIR"
+
+python -u -m scripts.base_train \
+    --depth="${depth}" \
+    --device-batch-size=32 \
+    --model-tag="${TAG}" \
+    --use_poly_attn \
+    --core-metric-every=999999 \
+    --sample-every=999999 \
+    --window-pattern=L \
+    2>&1 | tee -a "${RESULTS_DIR}/${TAG}_train.log"
+```
+</details>
+
+### Remarks
+Prior work such as *PolySketchFormer: Fast Transformers via Sketching Polynomial Kernels* (Kacham et al., 2024) demonstrated that an even-degree (degree-8) polynomial can match softmax perplexity. In contrast, our polynomial $\phi(x) = x^9 + 0.01x$ is an **odd function** coupled with post-attention RMSNorm, demonstrating that neither non-negativity nor the sum-to-one (row-stochastic) constraint of attention weights is strictly required to achieve competitive performance on small-scale language models.
+
 # nanochat
 
 ![nanochat logo](dev/nanochat.png)
