@@ -81,7 +81,10 @@ python -u -m scripts.base_train \
 </details>
 
 ### Remarks
-Prior work such as *PolySketchFormer: Fast Transformers via Sketching Polynomial Kernels* (Kacham et al., 2024) demonstrated that an even-degree (degree-8) polynomial can match softmax perplexity. In contrast, our polynomial $\phi(x) = x^9 + 0.01x$ is an **odd function** coupled with post-attention RMSNorm, demonstrating that neither non-negativity nor the sum-to-one (row-stochastic) constraint of attention weights is strictly required to achieve competitive performance on small-scale language models.
+Prior polynomial kernel approaches such as *PolySketchFormer: Fast Transformers via Sketching Polynomial Kernels* (Kacham et al., 2024) typically rely on even-degree (e.g., degree-8) polynomials to enforce non-negative attention weights. Meanwhile, recent architectures such as *Differential Transformer* (Ye et al., 2025) have shown that signed (negative) attention weights can suppress attention noise and improve expressivity, and post-attention normalization (e.g., RMSNorm) is a well-established practice for stabilizing unnormalized attention outputs in place of denominator normalization. Building on these insights, our formulation pairs an **odd-degree polynomial** $\phi(x) = x^9 + 0.01x$ with post-attention RMSNorm, showing that a simple odd polynomial kernel without non-negativity or row-stochastic constraints can match or slightly outperform standard softmax attention on small-scale language models.
+
+### AI Disclosure
+Gemini 4 Argon is used to write the triton kernel, check code, and revise the README.
 
 # nanochat
 
